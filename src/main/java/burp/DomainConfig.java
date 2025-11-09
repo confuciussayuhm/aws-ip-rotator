@@ -6,7 +6,7 @@ import java.util.Random;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Configuration for a domain with multiple FireProx gateways and rotation strategy
+ * Configuration for a domain with multiple AWS IP Rotator gateways and rotation strategy
  */
 public class DomainConfig {
     public enum RotationStrategy {

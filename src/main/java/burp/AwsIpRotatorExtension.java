@@ -18,21 +18,32 @@ import java.awt.event.MouseEvent;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
- * FireProx Burp Extension
+ * AWS IP Rotator Burp Extension
  *
- * This extension automatically rewrites requests to route through AWS FireProx gateways.
- * It modifies the SNI, Host header, and prepends the FireProx path to all matching requests.
+ * This extension automatically rewrites requests to route through AWS IP Rotator gateways.
+ * It modifies the SNI, Host header, and prepends the gateway path to all matching requests.
  */
-public class FireProxExtension implements BurpExtension {
+public class AwsIpRotatorExtension implements BurpExtension {
+    // Blacklist of banned stage names (common AWS/security terms that may be flagged)
+    private static final String[] BANNED_STAGE_NAMES = {
+        "proxy", "fireprox", "api", "aws", "gateway", "prod", "production",
+        "dev", "development", "test", "staging", "vpn", "tunnel", "forward",
+        "redirect", "bypass", "rotate", "rotation", "security", "pentest"
+    };
+
     private MontoyaApi api;
     private Logging logging;
-    private FireProxConfig config;
-    private FireProxManager awsManager;
+    private AwsIpRotatorConfig config;
+    private AwsIpRotatorManager awsManager;
     private JPanel mainPanel;
     private DefaultTableModel gatewaysTableModel;
     private DefaultTableModel mappingsTableModel;
@@ -41,13 +52,13 @@ public class FireProxExtension implements BurpExtension {
     public void initialize(MontoyaApi api) {
         this.api = api;
         this.logging = api.logging();
-        this.config = new FireProxConfig();
+        this.config = new AwsIpRotatorConfig();
 
         // Set extension name
         api.extension().setName("AWS IP Rotator");
 
         // Register HTTP handler
-        api.http().registerHttpHandler(new FireProxHttpHandler());
+        api.http().registerHttpHandler(new AwsIpRotatorHttpHandler());
 
         // Create and register UI
         createUI();
@@ -55,6 +66,22 @@ public class FireProxExtension implements BurpExtension {
 
         logging.logToOutput("AWS IP Rotator loaded successfully!");
         logging.logToOutput("Configure multi-region rotation in the 'AWS IP Rotator' tab");
+    }
+
+    /**
+     * Check if a stage name is in the blacklist
+     */
+    private static boolean isStagNameBanned(String stageName) {
+        if (stageName == null || stageName.trim().isEmpty()) {
+            return false;
+        }
+        String lowerStageName = stageName.trim().toLowerCase();
+        for (String banned : BANNED_STAGE_NAMES) {
+            if (lowerStageName.equals(banned.toLowerCase())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -371,7 +398,7 @@ public class FireProxExtension implements BurpExtension {
     private void addGatewayToDomain(DomainConfig dc, JTable domainsTable, int row,
                                     DefaultListModel<String> gatewayListModel) {
         String gatewayUrl = JOptionPane.showInputDialog(mainPanel,
-            "Enter FireProx Gateway URL:",
+            "Enter AWS IP Rotator Gateway URL:",
             "Add Gateway",
             JOptionPane.PLAIN_MESSAGE);
 
@@ -564,46 +591,126 @@ public class FireProxExtension implements BurpExtension {
                     JOptionPane.WARNING_MESSAGE);
 
                 if (confirm == JOptionPane.YES_OPTION) {
-                    int successCount = 0;
-                    int failureCount = 0;
-                    StringBuilder results = new StringBuilder();
+                    logging.logToOutput("Deleting " + selectedRows.length + " gateway(s) (parallel execution)...");
 
-                    // Delete in reverse order to avoid index shifting issues
-                    for (int i = selectedRows.length - 1; i >= 0; i--) {
+                    // Collect gateway info before deletion
+                    List<Map<String, String>> gatewaysToDelete = new ArrayList<>();
+                    for (int i = 0; i < selectedRows.length; i++) {
                         int viewRow = selectedRows[i];
-                        // Convert view row to model row (important when table is sorted)
                         int modelRow = gatewaysTable.convertRowIndexToModel(viewRow);
 
-                        String apiId = (String) gatewaysTableModel.getValueAt(modelRow, 0);
-                        String name = (String) gatewaysTableModel.getValueAt(modelRow, 1);
-                        String region = (String) gatewaysTableModel.getValueAt(modelRow, 4); // Get region from column 4
-
-                        if (awsManager != null && awsManager.deleteGatewayInRegion(apiId, region)) {
-                            logging.logToOutput("Deleted gateway: " + apiId + " in region " + region);
-                            gatewaysTableModel.removeRow(modelRow);
-                            successCount++;
-                        } else {
-                            logging.logToError("Failed to delete gateway: " + apiId + " in region " + region);
-                            results.append("✗ ").append(name).append(" (").append(apiId).append(") - ").append(region).append("\n");
-                            failureCount++;
-                        }
+                        Map<String, String> gatewayInfo = new HashMap<>();
+                        gatewayInfo.put("apiId", (String) gatewaysTableModel.getValueAt(modelRow, 0));
+                        gatewayInfo.put("name", (String) gatewaysTableModel.getValueAt(modelRow, 1));
+                        gatewayInfo.put("region", (String) gatewaysTableModel.getValueAt(modelRow, 4));
+                        gatewayInfo.put("modelRow", String.valueOf(modelRow));
+                        gatewaysToDelete.add(gatewayInfo);
                     }
 
-                    // Show summary
-                    if (selectedRows.length > 1) {
-                        String title = (failureCount == 0) ? "Success" : "Partial Success";
-                        int messageType = (failureCount == 0) ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE;
-                        String summary = String.format("Deletion complete:\n\nSuccess: %d | Failed: %d", successCount, failureCount);
-                        if (failureCount > 0) {
-                            summary += "\n\nFailed deletions:\n" + results.toString();
+                    // Use SwingWorker to delete gateways in background
+                    SwingWorker<Map<String, Object>, Void> worker = new SwingWorker<>() {
+                        @Override
+                        protected Map<String, Object> doInBackground() {
+                            Map<String, Object> result = new HashMap<>();
+                            List<String> successDeletes = Collections.synchronizedList(new ArrayList<>());
+                            List<String> failures = Collections.synchronizedList(new ArrayList<>());
+
+                            // Create executor service for parallel execution
+                            ExecutorService executor = Executors.newFixedThreadPool(Math.min(gatewaysToDelete.size(), 10));
+                            List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+                            for (Map<String, String> gateway : gatewaysToDelete) {
+                                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                                    String apiId = gateway.get("apiId");
+                                    String name = gateway.get("name");
+                                    String region = gateway.get("region");
+
+                                    try {
+                                        if (awsManager != null && awsManager.deleteGatewayInRegion(apiId, region)) {
+                                            successDeletes.add(apiId);
+                                            logging.logToOutput("Deleted gateway: " + apiId + " in region " + region);
+                                        } else {
+                                            failures.add(name + " (" + apiId + ") - " + region);
+                                            logging.logToError("Failed to delete gateway: " + apiId + " in region " + region);
+                                        }
+                                    } catch (Exception e) {
+                                        failures.add(name + " (" + apiId + ") - " + region + ": " + e.getMessage());
+                                        logging.logToError("Exception deleting gateway " + apiId + ": " + e.getMessage());
+                                    }
+                                }, executor);
+
+                                futures.add(future);
+                            }
+
+                            // Wait for all to complete
+                            try {
+                                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+                            } catch (Exception e) {
+                                logging.logToError("Error during parallel gateway deletion: " + e.getMessage());
+                            } finally {
+                                executor.shutdown();
+                            }
+
+                            result.put("success", successDeletes);
+                            result.put("failures", failures);
+                            return result;
                         }
-                        JOptionPane.showMessageDialog(mainPanel, summary, title, messageType);
-                    } else if (failureCount > 0) {
-                        JOptionPane.showMessageDialog(mainPanel,
-                            "Failed to delete gateway: " + awsManager.getLastError(),
-                            "Error",
-                            JOptionPane.ERROR_MESSAGE);
-                    }
+
+                        @Override
+                        protected void done() {
+                            try {
+                                Map<String, Object> result = get();
+                                @SuppressWarnings("unchecked")
+                                List<String> successDeletes = (List<String>) result.get("success");
+                                @SuppressWarnings("unchecked")
+                                List<String> failures = (List<String>) result.get("failures");
+
+                                // Remove successfully deleted gateways from table (in reverse order)
+                                for (int i = gatewaysToDelete.size() - 1; i >= 0; i--) {
+                                    Map<String, String> gateway = gatewaysToDelete.get(i);
+                                    String apiId = gateway.get("apiId");
+                                    if (successDeletes.contains(apiId)) {
+                                        int modelRow = Integer.parseInt(gateway.get("modelRow"));
+                                        // Find current row index (may have changed)
+                                        for (int row = 0; row < gatewaysTableModel.getRowCount(); row++) {
+                                            if (gatewaysTableModel.getValueAt(row, 0).equals(apiId)) {
+                                                gatewaysTableModel.removeRow(row);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                int successCount = successDeletes.size();
+                                int failureCount = failures.size();
+
+                                // Show summary
+                                if (gatewaysToDelete.size() > 1 || failureCount > 0) {
+                                    String title = (failureCount == 0) ? "Success" : "Partial Success";
+                                    int messageType = (failureCount == 0) ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE;
+                                    StringBuilder summary = new StringBuilder(String.format("Deletion complete:\n\nSuccess: %d | Failed: %d", successCount, failureCount));
+                                    if (failureCount > 0) {
+                                        summary.append("\n\nFailed deletions:\n");
+                                        for (String failure : failures) {
+                                            summary.append("✗ ").append(failure).append("\n");
+                                        }
+                                    }
+                                    JOptionPane.showMessageDialog(mainPanel, summary.toString(), title, messageType);
+                                }
+
+                                logging.logToOutput("Gateway deletion complete: " + successCount + " succeeded, " + failureCount + " failed");
+
+                            } catch (Exception ex) {
+                                logging.logToError("Failed to process gateway deletion results: " + ex.getMessage());
+                                JOptionPane.showMessageDialog(mainPanel,
+                                    "Failed to delete gateways: " + ex.getMessage(),
+                                    "Error",
+                                    JOptionPane.ERROR_MESSAGE);
+                            }
+                        }
+                    };
+
+                    worker.execute();
                 }
             } else {
                 JOptionPane.showMessageDialog(mainPanel,
@@ -712,14 +819,14 @@ public class FireProxExtension implements BurpExtension {
             secretKeyField.setEnabled(selected == 2);
         });
 
-        // Connect button
+        // Test connection button
         gbc.gridx = 0;
         gbc.gridy = 6;
         gbc.gridwidth = 2;
         gbc.anchor = GridBagConstraints.CENTER;
-        JButton connectButton = new JButton("Connect to AWS");
+        JButton connectButton = new JButton("Test Connection to AWS");
         connectButton.addActionListener(e -> {
-            awsManager = new FireProxManager();
+            awsManager = new AwsIpRotatorManager();
             boolean success = false;
             int authMethod = authMethodCombo.getSelectedIndex();
             String region = (String) regionCombo.getSelectedItem();
@@ -786,9 +893,13 @@ public class FireProxExtension implements BurpExtension {
             "   - Default: Uses credentials from ~/.aws/credentials or environment\n" +
             "   - AWS Profile: Uses a named profile from ~/.aws/credentials\n" +
             "   - Access Key: Provide explicit AWS credentials\n\n" +
-            "2. Select your AWS region (default: us-east-1)\n\n" +
-            "3. Click 'Connect to AWS' to initialize the connection\n\n" +
-            "4. Go to the 'AWS Gateways' tab to manage FireProx gateways\n\n" +
+            "2. Select your AWS region (used for connection testing only)\n" +
+            "   Note: The extension queries ALL regions when listing/managing gateways\n\n" +
+            "3. Click 'Test Connection to AWS' to verify your credentials\n" +
+            "   Note: Credentials are not stored, only tested\n\n" +
+            "4. Go to the 'AWS Gateways' tab to manage AWS IP Rotator gateways\n" +
+            "   - 'Refresh List' shows gateways from ALL AWS regions\n" +
+            "   - 'Create Gateway' lets you create in single or multiple regions\n\n" +
             "Note: Ensure your AWS IAM user has API Gateway permissions:\n" +
             "- apigateway:*\n" +
             "- execute-api:Invoke"
@@ -802,7 +913,7 @@ public class FireProxExtension implements BurpExtension {
     }
 
     /**
-     * Refresh the AWS gateway list
+     * Refresh the AWS gateway list in background thread to avoid freezing UI
      */
     private void refreshGatewayList() {
         if (awsManager == null) {
@@ -814,25 +925,48 @@ public class FireProxExtension implements BurpExtension {
         }
 
         // Show progress message
-        logging.logToOutput("Refreshing gateway list across all AWS regions...");
+        logging.logToOutput("Refreshing gateway list across all AWS regions (this may take a few seconds)...");
 
+        // Clear table immediately
         gatewaysTableModel.setRowCount(0);
 
-        // List gateways from ALL regions
-        List<FireProxManager.FireProxGateway> gateways = awsManager.listGatewaysAllRegions();
+        // Use SwingWorker to query in background thread
+        SwingWorker<List<AwsIpRotatorManager.AwsIpRotatorGateway>, Void> worker = new SwingWorker<>() {
+            @Override
+            protected List<AwsIpRotatorManager.AwsIpRotatorGateway> doInBackground() {
+                // This runs in background thread - won't freeze UI
+                return awsManager.listGatewaysAllRegions();
+            }
 
-        for (FireProxManager.FireProxGateway gateway : gateways) {
-            gatewaysTableModel.addRow(new Object[]{
-                gateway.apiId,
-                gateway.name,
-                gateway.targetUrl,
-                gateway.proxyUrl,
-                gateway.region,
-                gateway.createdDate.toString()
-            });
-        }
+            @Override
+            protected void done() {
+                try {
+                    // This runs on UI thread after background work completes
+                    List<AwsIpRotatorManager.AwsIpRotatorGateway> gateways = get();
 
-        logging.logToOutput("Refreshed gateway list: " + gateways.size() + " gateways found across all regions");
+                    for (AwsIpRotatorManager.AwsIpRotatorGateway gateway : gateways) {
+                        gatewaysTableModel.addRow(new Object[]{
+                            gateway.apiId,
+                            gateway.name,
+                            gateway.targetUrl,
+                            gateway.proxyUrl,
+                            gateway.region,
+                            gateway.createdDate.toString()
+                        });
+                    }
+
+                    logging.logToOutput("Refreshed gateway list: " + gateways.size() + " gateways found across all regions");
+                } catch (Exception ex) {
+                    logging.logToError("Failed to refresh gateway list: " + ex.getMessage());
+                    JOptionPane.showMessageDialog(mainPanel,
+                        "Failed to refresh gateway list: " + ex.getMessage(),
+                        "Error",
+                        JOptionPane.ERROR_MESSAGE);
+                }
+            }
+        };
+
+        worker.execute();
     }
 
     /**
@@ -853,6 +987,7 @@ public class FireProxExtension implements BurpExtension {
 
         if (dialog.isConfirmed()) {
             String targetUrl = dialog.getTargetUrl().trim();
+            String stageName = dialog.getStageName();
             List<String> selectedRegions = dialog.getSelectedRegions();
 
             if (selectedRegions.isEmpty()) {
@@ -866,45 +1001,112 @@ public class FireProxExtension implements BurpExtension {
             try {
                 new URL(targetUrl);
 
-                // Create progress dialog for multi-region creation
-                StringBuilder resultMessage = new StringBuilder();
-                int successCount = 0;
-                int failureCount = 0;
+                logging.logToOutput("Creating gateways in " + selectedRegions.size() + " region(s) (parallel execution)...");
 
-                for (String region : selectedRegions) {
-                    logging.logToOutput("Creating FireProx gateway for: " + targetUrl + " in region: " + region);
+                // Use SwingWorker to create gateways in background
+                SwingWorker<Map<String, Object>, Void> worker = new SwingWorker<>() {
+                    @Override
+                    protected Map<String, Object> doInBackground() {
+                        Map<String, Object> result = new HashMap<>();
+                        List<AwsIpRotatorManager.AwsIpRotatorGateway> successGateways = Collections.synchronizedList(new ArrayList<>());
+                        List<String> failures = Collections.synchronizedList(new ArrayList<>());
 
-                    FireProxManager.FireProxGateway gateway = awsManager.createGatewayInRegion(targetUrl, region);
+                        // Create executor service for parallel execution
+                        ExecutorService executor = Executors.newFixedThreadPool(Math.min(selectedRegions.size(), 10));
+                        List<CompletableFuture<Void>> futures = new ArrayList<>();
 
-                    if (gateway != null) {
-                        gatewaysTableModel.addRow(new Object[]{
-                            gateway.apiId,
-                            gateway.name,
-                            gateway.targetUrl,
-                            gateway.proxyUrl,
-                            gateway.region,
-                            gateway.createdDate.toString()
-                        });
+                        for (String region : selectedRegions) {
+                            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                                try {
+                                    logging.logToOutput("Creating AWS IP Rotator gateway for: " + targetUrl + " in region: " + region + " with stage: " + stageName);
 
-                        logging.logToOutput("Created gateway: " + gateway.apiId + " in " + region);
-                        resultMessage.append("✓ ").append(region).append(": ").append(gateway.apiId).append("\n");
-                        successCount++;
-                    } else {
-                        logging.logToError("Failed to create gateway in " + region + ": " + awsManager.getLastError());
-                        resultMessage.append("✗ ").append(region).append(": Failed - ").append(awsManager.getLastError()).append("\n");
-                        failureCount++;
+                                    AwsIpRotatorManager.AwsIpRotatorGateway gateway = awsManager.createGatewayInRegion(targetUrl, region, stageName);
+
+                                    if (gateway != null) {
+                                        successGateways.add(gateway);
+                                        logging.logToOutput("Created gateway: " + gateway.apiId + " in " + region);
+                                    } else {
+                                        failures.add(region + ": " + awsManager.getLastError());
+                                        logging.logToError("Failed to create gateway in " + region + ": " + awsManager.getLastError());
+                                    }
+                                } catch (Exception e) {
+                                    failures.add(region + ": " + e.getMessage());
+                                    logging.logToError("Exception creating gateway in " + region + ": " + e.getMessage());
+                                }
+                            }, executor);
+
+                            futures.add(future);
+                        }
+
+                        // Wait for all to complete
+                        try {
+                            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+                        } catch (Exception e) {
+                            logging.logToError("Error during parallel gateway creation: " + e.getMessage());
+                        } finally {
+                            executor.shutdown();
+                        }
+
+                        result.put("success", successGateways);
+                        result.put("failures", failures);
+                        return result;
                     }
-                }
 
-                // Show summary
-                String title = (failureCount == 0) ? "Success" : "Partial Success";
-                int messageType = (failureCount == 0) ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE;
+                    @Override
+                    protected void done() {
+                        try {
+                            Map<String, Object> result = get();
+                            @SuppressWarnings("unchecked")
+                            List<AwsIpRotatorManager.AwsIpRotatorGateway> successGateways = (List<AwsIpRotatorManager.AwsIpRotatorGateway>) result.get("success");
+                            @SuppressWarnings("unchecked")
+                            List<String> failures = (List<String>) result.get("failures");
 
-                JOptionPane.showMessageDialog(mainPanel,
-                    String.format("Gateway creation complete:\n\n%s\nSuccess: %d | Failed: %d",
-                        resultMessage.toString(), successCount, failureCount),
-                    title,
-                    messageType);
+                            // Add successful gateways to table
+                            for (AwsIpRotatorManager.AwsIpRotatorGateway gateway : successGateways) {
+                                gatewaysTableModel.addRow(new Object[]{
+                                    gateway.apiId,
+                                    gateway.name,
+                                    gateway.targetUrl,
+                                    gateway.proxyUrl,
+                                    gateway.region,
+                                    gateway.createdDate.toString()
+                                });
+                            }
+
+                            // Build summary message
+                            StringBuilder resultMessage = new StringBuilder();
+                            for (AwsIpRotatorManager.AwsIpRotatorGateway gateway : successGateways) {
+                                resultMessage.append("✓ ").append(gateway.region).append(": ").append(gateway.apiId).append("\n");
+                            }
+                            for (String failure : failures) {
+                                resultMessage.append("✗ ").append(failure).append("\n");
+                            }
+
+                            int successCount = successGateways.size();
+                            int failureCount = failures.size();
+
+                            String title = (failureCount == 0) ? "Success" : "Partial Success";
+                            int messageType = (failureCount == 0) ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE;
+
+                            JOptionPane.showMessageDialog(mainPanel,
+                                String.format("Gateway creation complete:\n\n%s\nSuccess: %d | Failed: %d",
+                                    resultMessage.toString(), successCount, failureCount),
+                                title,
+                                messageType);
+
+                            logging.logToOutput("Gateway creation complete: " + successCount + " succeeded, " + failureCount + " failed");
+
+                        } catch (Exception ex) {
+                            logging.logToError("Failed to process gateway creation results: " + ex.getMessage());
+                            JOptionPane.showMessageDialog(mainPanel,
+                                "Failed to create gateways: " + ex.getMessage(),
+                                "Error",
+                                JOptionPane.ERROR_MESSAGE);
+                        }
+                    }
+                };
+
+                worker.execute();
 
             } catch (MalformedURLException ex) {
                 JOptionPane.showMessageDialog(mainPanel,
@@ -920,6 +1122,7 @@ public class FireProxExtension implements BurpExtension {
      */
     private static class GatewayCreationDialog extends JDialog {
         private JTextField urlField;
+        private JTextField stageNameField;
         private JCheckBox multiRegionCheckbox;
         private JComboBox<String> singleRegionCombo;
         private JPanel regionSelectionPanel;
@@ -935,7 +1138,7 @@ public class FireProxExtension implements BurpExtension {
         };
 
         public GatewayCreationDialog(JPanel parent) {
-            super(SwingUtilities.getWindowAncestor(parent), "Create FireProx Gateway", Dialog.ModalityType.APPLICATION_MODAL);
+            super(SwingUtilities.getWindowAncestor(parent), "Create AWS IP Rotator Gateway", Dialog.ModalityType.APPLICATION_MODAL);
 
             regionCheckboxes = new HashMap<>();
             initComponents();
@@ -960,18 +1163,27 @@ public class FireProxExtension implements BurpExtension {
             gbc.gridx = 1; gbc.gridy = 0; gbc.gridwidth = 2;
             contentPanel.add(urlField, gbc);
 
+            // Stage Name
+            gbc.gridx = 0; gbc.gridy = 1; gbc.gridwidth = 1;
+            contentPanel.add(new JLabel("Stage Name:"), gbc);
+
+            stageNameField = new JTextField("v1", 20);
+            stageNameField.setToolTipText("AWS API Gateway stage name (e.g., v1, v2, release, alpha)");
+            gbc.gridx = 1; gbc.gridy = 1; gbc.gridwidth = 2;
+            contentPanel.add(stageNameField, gbc);
+
             // Multi-region checkbox
             multiRegionCheckbox = new JCheckBox("Create in multiple regions");
-            gbc.gridx = 0; gbc.gridy = 1; gbc.gridwidth = 3;
+            gbc.gridx = 0; gbc.gridy = 2; gbc.gridwidth = 3;
             contentPanel.add(multiRegionCheckbox, gbc);
 
             // Single region selection (shown by default)
-            gbc.gridx = 0; gbc.gridy = 2; gbc.gridwidth = 1;
+            gbc.gridx = 0; gbc.gridy = 3; gbc.gridwidth = 1;
             contentPanel.add(new JLabel("Region:"), gbc);
 
             singleRegionCombo = new JComboBox<>(COMMON_REGIONS);
             singleRegionCombo.setSelectedItem("us-east-1");
-            gbc.gridx = 1; gbc.gridy = 2; gbc.gridwidth = 2;
+            gbc.gridx = 1; gbc.gridy = 3; gbc.gridwidth = 2;
             contentPanel.add(singleRegionCombo, gbc);
 
             // Multi-region selection panel (hidden by default)
@@ -984,11 +1196,26 @@ public class FireProxExtension implements BurpExtension {
                 regionSelectionPanel.add(cb);
             }
 
+            // "Select All" checkbox for multi-region
+            JCheckBox selectAllCheckbox = new JCheckBox("Select All Regions");
+            selectAllCheckbox.setVisible(false);
+            selectAllCheckbox.addActionListener(e -> {
+                boolean selected = selectAllCheckbox.isSelected();
+                for (JCheckBox cb : regionCheckboxes.values()) {
+                    cb.setSelected(selected);
+                }
+            });
+
+            gbc.gridx = 0; gbc.gridy = 4; gbc.gridwidth = 3;
+            gbc.fill = GridBagConstraints.HORIZONTAL;
+            gbc.weightx = 1.0; gbc.weighty = 0;
+            contentPanel.add(selectAllCheckbox, gbc);
+
             JScrollPane scrollPane = new JScrollPane(regionSelectionPanel);
             scrollPane.setPreferredSize(new Dimension(500, 150));
             scrollPane.setVisible(false);
 
-            gbc.gridx = 0; gbc.gridy = 3; gbc.gridwidth = 3;
+            gbc.gridx = 0; gbc.gridy = 5; gbc.gridwidth = 3;
             gbc.fill = GridBagConstraints.BOTH;
             gbc.weightx = 1.0; gbc.weighty = 1.0;
             contentPanel.add(scrollPane, gbc);
@@ -997,6 +1224,7 @@ public class FireProxExtension implements BurpExtension {
             multiRegionCheckbox.addActionListener(e -> {
                 boolean multiRegion = multiRegionCheckbox.isSelected();
                 singleRegionCombo.setVisible(!multiRegion);
+                selectAllCheckbox.setVisible(multiRegion);
                 scrollPane.setVisible(multiRegion);
                 pack();
             });
@@ -1011,6 +1239,26 @@ public class FireProxExtension implements BurpExtension {
             createBtn.addActionListener(e -> {
                 if (urlField.getText().trim().isEmpty()) {
                     JOptionPane.showMessageDialog(this, "Please enter a target URL", "Error", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+                if (stageNameField.getText().trim().isEmpty()) {
+                    JOptionPane.showMessageDialog(this, "Please enter a stage name", "Error", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+                // Validate stage name (alphanumeric, hyphens, underscores only)
+                String stageName = stageNameField.getText().trim();
+                if (!stageName.matches("[a-zA-Z0-9_-]+")) {
+                    JOptionPane.showMessageDialog(this, "Stage name can only contain letters, numbers, hyphens, and underscores", "Error", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+                // Check if stage name is blacklisted
+                if (isStagNameBanned(stageName)) {
+                    JOptionPane.showMessageDialog(this,
+                        "Stage name '" + stageName + "' is not allowed.\n\n" +
+                        "This stage name may be flagged by security systems.\n" +
+                        "Please use a neutral name like: v1, v2, v3, release, alpha, beta, etc.",
+                        "Banned Stage Name",
+                        JOptionPane.ERROR_MESSAGE);
                     return;
                 }
                 confirmed = true;
@@ -1033,6 +1281,10 @@ public class FireProxExtension implements BurpExtension {
 
         public String getTargetUrl() {
             return urlField.getText();
+        }
+
+        public String getStageName() {
+            return stageNameField.getText().trim();
         }
 
         public List<String> getSelectedRegions() {
@@ -1110,7 +1362,7 @@ public class FireProxExtension implements BurpExtension {
     }
 
     /**
-     * Update a gateway
+     * Update a gateway (non-blocking)
      */
     private void updateGateway(String apiId) {
         if (awsManager == null) {
@@ -1123,25 +1375,51 @@ public class FireProxExtension implements BurpExtension {
             JOptionPane.PLAIN_MESSAGE);
 
         if (newTargetUrl != null && !newTargetUrl.trim().isEmpty()) {
-            newTargetUrl = newTargetUrl.trim();
+            final String targetUrl = newTargetUrl.trim();
 
             try {
-                new URL(newTargetUrl);
-                boolean success = awsManager.updateGateway(apiId, newTargetUrl);
+                new URL(targetUrl);
 
-                if (success) {
-                    logging.logToOutput("Updated gateway " + apiId + " to point to " + newTargetUrl);
-                    JOptionPane.showMessageDialog(mainPanel,
-                        "Gateway updated successfully!",
-                        "Success",
-                        JOptionPane.INFORMATION_MESSAGE);
-                    refreshGatewayList();
-                } else {
-                    JOptionPane.showMessageDialog(mainPanel,
-                        "Failed to update gateway: " + awsManager.getLastError(),
-                        "Error",
-                        JOptionPane.ERROR_MESSAGE);
-                }
+                logging.logToOutput("Updating gateway " + apiId + " (background operation)...");
+
+                // Use SwingWorker to update gateway in background
+                SwingWorker<Boolean, Void> worker = new SwingWorker<>() {
+                    @Override
+                    protected Boolean doInBackground() {
+                        // This runs in background thread - won't freeze UI
+                        return awsManager.updateGateway(apiId, targetUrl);
+                    }
+
+                    @Override
+                    protected void done() {
+                        try {
+                            boolean success = get();
+
+                            if (success) {
+                                logging.logToOutput("Updated gateway " + apiId + " to point to " + targetUrl);
+                                JOptionPane.showMessageDialog(mainPanel,
+                                    "Gateway updated successfully!",
+                                    "Success",
+                                    JOptionPane.INFORMATION_MESSAGE);
+                                refreshGatewayList();
+                            } else {
+                                JOptionPane.showMessageDialog(mainPanel,
+                                    "Failed to update gateway: " + awsManager.getLastError(),
+                                    "Error",
+                                    JOptionPane.ERROR_MESSAGE);
+                            }
+                        } catch (Exception ex) {
+                            logging.logToError("Failed to update gateway: " + ex.getMessage());
+                            JOptionPane.showMessageDialog(mainPanel,
+                                "Failed to update gateway: " + ex.getMessage(),
+                                "Error",
+                                JOptionPane.ERROR_MESSAGE);
+                        }
+                    }
+                };
+
+                worker.execute();
+
             } catch (MalformedURLException ex) {
                 JOptionPane.showMessageDialog(mainPanel,
                     "Invalid URL format!",
@@ -1188,16 +1466,16 @@ public class FireProxExtension implements BurpExtension {
     /**
      * Configuration storage class
      */
-    private static class FireProxConfig {
+    private static class AwsIpRotatorConfig {
         boolean enabled = false;
         Map<String, DomainConfig> domainConfigs = new HashMap<>(); // domain -> DomainConfig
         boolean preserveOriginalHost = false;
     }
 
     /**
-     * HTTP Handler that rewrites requests to use FireProx with multi-region rotation
+     * HTTP Handler that rewrites requests to use AWS IP Rotator with multi-region rotation
      */
-    private class FireProxHttpHandler implements HttpHandler {
+    private class AwsIpRotatorHttpHandler implements HttpHandler {
         @Override
         public RequestToBeSentAction handleHttpRequestToBeSent(HttpRequestToBeSent requestToBeSent) {
             // Only process if enabled and configured
@@ -1223,16 +1501,16 @@ public class FireProxExtension implements BurpExtension {
             }
 
             // Get the next gateway URL based on rotation strategy
-            String fireProxGatewayUrl = domainConfig.getNextGatewayUrl();
+            String awsIpRotatorGatewayUrl = domainConfig.getNextGatewayUrl();
 
             // Safety check
-            if (fireProxGatewayUrl == null) {
+            if (awsIpRotatorGatewayUrl == null) {
                 return RequestToBeSentAction.continueWith(requestToBeSent);
             }
 
             try {
-                // Parse FireProx gateway URL
-                URL gatewayUrl = new URL(fireProxGatewayUrl);
+                // Parse AWS IP Rotator gateway URL
+                URL gatewayUrl = new URL(awsIpRotatorGatewayUrl);
                 String gatewayHost = gatewayUrl.getHost();
                 int gatewayPort = gatewayUrl.getPort() != -1 ? gatewayUrl.getPort() :
                                   (gatewayUrl.getProtocol().equals("https") ? 443 : 80);
@@ -1292,7 +1570,7 @@ public class FireProxExtension implements BurpExtension {
                 return RequestToBeSentAction.continueWith(modifiedRequest);
 
             } catch (MalformedURLException e) {
-                logging.logToError("Invalid FireProx gateway URL: " + e.getMessage());
+                logging.logToError("Invalid AWS IP Rotator gateway URL: " + e.getMessage());
                 return RequestToBeSentAction.continueWith(requestToBeSent);
             }
         }

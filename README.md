@@ -1,17 +1,17 @@
 # AWS IP Rotator
 
-A comprehensive Burp Suite extension that integrates AWS API Gateway management for creating and managing FireProx gateways directly from Burp Suite. Automatically route requests through AWS API Gateway for IP address rotation.
+A comprehensive Burp Suite extension that integrates AWS API Gateway management for creating and managing AWS IP Rotator gateways directly from Burp Suite. Automatically route requests through AWS API Gateway for IP address rotation.
 
-This project was inspired by and reimplements the functionality of the [FireProx](https://github.com/ustayready/fireprox) tool by [@ustayready](https://github.com/ustayready), which pioneered the technique of using AWS API Gateway for rotating source IPs.
+This project was inspired by and reimplements the functionality of the [AWS IP Rotator](https://github.com/ustayready/fireprox) tool by [@ustayready](https://github.com/ustayready), which pioneered the technique of using AWS API Gateway for rotating source IPs.
 
 ## Overview
 
-This extension provides **complete AWS API Gateway management** directly within Burp Suite, eliminating the need for the separate Python FireProx tool. Create, manage, and delete FireProx gateways, then automatically rewrite HTTP requests to route through them. FireProx leverages AWS API Gateway to create pass-through proxies that rotate the source IP address with every request.
+This extension provides **complete AWS API Gateway management** directly within Burp Suite, eliminating the need for the separate Python AWS IP Rotator tool. Create, manage, and delete AWS IP Rotator gateways, then automatically rewrite HTTP requests to route through them. AWS IP Rotator leverages AWS API Gateway to create pass-through proxies that rotate the source IP address with every request.
 
 ### Features
 
 #### AWS Gateway Management
-- ✅ **Create FireProx gateways** directly from Burp Suite
+- ✅ **Create AWS IP Rotator gateways** directly from Burp Suite
 - ✅ **List all existing gateways** in your AWS account
 - ✅ **Update gateway** target URLs on the fly
 - ✅ **Delete gateways** when no longer needed
@@ -32,7 +32,7 @@ This extension provides **complete AWS API Gateway management** directly within 
 #### Request Routing
 - ✅ **Multiple domain support** - Configure multiple target domains simultaneously
 - ✅ **Automatic request rewriting** for specified target domains
-- ✅ **SNI modification** to match FireProx gateway
+- ✅ **SNI modification** to match AWS IP Rotator gateway
 - ✅ **Host header rewriting**
 - ✅ **Preservation of original paths and query parameters**
 - ✅ **Optional X-Original-Host header** for debugging
@@ -49,7 +49,7 @@ This extension provides **complete AWS API Gateway management** directly within 
    - `apigateway:*` (or more restrictive: GET, POST, PUT, DELETE, PATCH on API Gateway resources)
    - `execute-api:Invoke` (optional, for testing gateways)
 
-**Note**: You no longer need the separate Python FireProx tool - this extension provides all functionality directly!
+**Note**: You no longer need the separate Python AWS IP Rotator tool - this extension provides all functionality directly!
 
 ## Building the Extension
 
@@ -86,7 +86,7 @@ mvn clean package
 4. Select your AWS region (default: `us-east-1`)
 5. Click **Connect to AWS**
 
-### Step 2: Create FireProx Gateways
+### Step 2: Create AWS IP Rotator Gateways
 
 1. Navigate to the **AWS Gateways** tab
 2. Click **Create Gateway**
@@ -156,10 +156,10 @@ The extension supports routing a single domain through multiple AWS gateways acr
 
 Make a request to your configured target domain through Burp:
 - Original request: `https://api.example.com/v1/users`
-- Automatically rewritten to: `https://abc123xyz.execute-api.us-east-1.amazonaws.com/proxy/v1/users`
+- Automatically rewritten to: `https://abc123xyz.execute-api.us-east-1.amazonaws.com/v1/v1/users`
 
 The extension automatically:
-- Changes the destination to the FireProx gateway
+- Changes the destination to the AWS IP Rotator gateway
 - Updates the Host header
 - Sets the correct SNI
 - Preserves the original path and parameters
@@ -176,9 +176,9 @@ When you make a request to any configured target domain:
    - **Random**: Uses `java.util.Random` to pick any gateway
    - **Weighted Random**: Uses cumulative probability distribution based on gateway weights
 4. **Request Rewriting**:
-   - Updates HTTP service to point to the selected FireProx gateway
-   - Rewrites Host header to FireProx gateway hostname
-   - Prepends FireProx path to the original request path
+   - Updates HTTP service to point to the selected AWS IP Rotator gateway
+   - Rewrites Host header to AWS IP Rotator gateway hostname
+   - Prepends AWS IP Rotator path to the original request path
    - Optionally adds X-Original-Host header
 5. **SNI Handling**: The Montoya API automatically sets the correct SNI based on the new HTTP service
 
@@ -188,7 +188,7 @@ Each domain is independently routed through its configured gateways with automat
 
 ### Example 1: Single Domain, Single Region (Basic)
 
-**Scenario**: You want to scan `api.target.com` through one FireProx gateway
+**Scenario**: You want to scan `api.target.com` through one AWS IP Rotator gateway
 
 **Configuration**:
 1. Create one gateway in `us-east-1` for `https://api.target.com`
@@ -197,7 +197,7 @@ Each domain is independently routed through its configured gateways with automat
 
 **Result**:
 - Request to: `https://api.target.com/users/123`
-- Routes through: `https://a1b2c3d4.execute-api.us-east-1.amazonaws.com/proxy/users/123`
+- Routes through: `https://a1b2c3d4.execute-api.us-east-1.amazonaws.com/v1/users/123`
 - IP rotates via AWS API Gateway (single region)
 
 ### Example 2: Single Domain, Multi-Region (Maximum IP Diversity)
@@ -273,7 +273,7 @@ The extension logs all activity to Burp's extension output. Check the **Extensio
 - Check Burp's Extensions → Errors tab for details
 
 ### Requests aren't being modified
-- Verify "Enable FireProx routing" is checked in the **Domain Mappings** tab
+- Verify "Enable AWS IP Rotator routing" is checked in the **Domain Mappings** tab
 - Confirm you have added the target domain to the mappings table
 - Confirm the target domain matches exactly (case-insensitive)
 - Check Burp's Extensions → Output tab for log messages
@@ -292,7 +292,7 @@ The extension logs all activity to Burp's extension output. Check the **Extensio
 - Check Burp's Extensions → Errors tab for detailed error messages
 
 ### 403 Forbidden from AWS
-- Verify your FireProx gateway is active by refreshing the gateway list in the **AWS Gateways** tab
+- Verify your AWS IP Rotator gateway is active by refreshing the gateway list in the **AWS Gateways** tab
 - Ensure the gateway URL is correct in your domain mappings
 - Check AWS API Gateway quotas and limits
 - Verify the gateway wasn't manually deleted from AWS console
@@ -308,13 +308,13 @@ The extension logs all activity to Burp's extension output. Check the **Extensio
 - After free tier: ~$3.50 per million requests
 - Data transfer: Standard AWS rates apply
 
-Monitor your AWS billing dashboard when using FireProx gateways extensively.
+Monitor your AWS billing dashboard when using AWS IP Rotator gateways extensively.
 
 ## Limitations
 
 - Does not automatically handle WebSocket upgrades
-- FireProx gateways have AWS API Gateway rate limits (10,000 requests per second per region by default)
-- Each domain should have its own dedicated FireProx gateway for best results
+- AWS IP Rotator gateways have AWS API Gateway rate limits (10,000 requests per second per region by default)
+- Each domain should have its own dedicated AWS IP Rotator gateway for best results
 - AWS API Gateway may add latency (typically 50-200ms per request)
 
 ## Security Considerations
@@ -336,12 +336,12 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Credits
 
-- **FireProx**: [ustayready/fireprox](https://github.com/ustayready/fireprox)
+- **AWS IP Rotator**: [ustayready/fireprox](https://github.com/ustayready/fireprox)
 - **Burp Montoya API**: [PortSwigger](https://portswigger.net/burp/documentation/desktop/extensions/montoya-api)
 
 ## Support
 
 For issues related to:
 - **This extension**: Open an issue in this repository
-- **FireProx**: Visit the [FireProx repository](https://github.com/ustayready/fireprox)
+- **AWS IP Rotator**: Visit the [AWS IP Rotator repository](https://github.com/ustayready/fireprox)
 - **Burp Suite**: Check [PortSwigger Support](https://portswigger.net/support)

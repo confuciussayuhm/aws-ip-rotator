@@ -1,7 +1,7 @@
 package burp;
 
 /**
- * Configuration for a single FireProx gateway
+ * Configuration for a single AWS IP Rotator gateway
  */
 public class GatewayConfig {
     private final String gatewayUrl;

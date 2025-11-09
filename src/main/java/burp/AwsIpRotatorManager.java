@@ -15,14 +15,18 @@ import java.net.URL;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
- * FireProx Manager - Handles AWS API Gateway operations for creating rotating IP proxies
+ * AWS IP Rotator Manager - Handles AWS API Gateway operations for creating rotating IP proxies
  */
-public class FireProxManager {
+public class AwsIpRotatorManager {
     private ApiGatewayClient client;
     private Region region;
     private String lastError;
@@ -89,7 +93,7 @@ public class FireProxManager {
     }
 
     /**
-     * Get the Swagger/OpenAPI template for FireProx
+     * Get the Swagger/OpenAPI template for AWS IP Rotator
      */
     private String getSwaggerTemplate(String targetUrl) {
         // Remove trailing slash
@@ -103,7 +107,7 @@ public class FireProxManager {
             URL url = new URL(targetUrl);
             domain = url.getHost().replaceAll("\\.", "_");
         } catch (Exception e) {
-            domain = "proxy";
+            domain = "target";
         }
 
         String title = "aws_ip_rotator_" + domain;
@@ -206,17 +210,25 @@ public class FireProxManager {
     }
 
     /**
-     * Create a new FireProx gateway in the current region
+     * Create a new AWS IP Rotator gateway in the current region
      */
-    public FireProxGateway createGateway(String targetUrl) {
+    public AwsIpRotatorGateway createGateway(String targetUrl) {
         return createGatewayInRegion(targetUrl, region.id());
     }
 
     /**
-     * Create a new FireProx gateway in a specific region
+     * Create a new AWS IP Rotator gateway in a specific region with default stage name
      * This creates a temporary client for the specified region to create the gateway
      */
-    public FireProxGateway createGatewayInRegion(String targetUrl, String regionName) {
+    public AwsIpRotatorGateway createGatewayInRegion(String targetUrl, String regionName) {
+        return createGatewayInRegion(targetUrl, regionName, "v1");
+    }
+
+    /**
+     * Create a new AWS IP Rotator gateway in a specific region with custom stage name
+     * This creates a temporary client for the specified region to create the gateway
+     */
+    public AwsIpRotatorGateway createGatewayInRegion(String targetUrl, String regionName, String stageName) {
         ApiGatewayClient tempClient = null;
         try {
             Region targetRegion = Region.of(regionName);
@@ -246,21 +258,21 @@ public class FireProxManager {
             ImportRestApiResponse response = tempClient.importRestApi(request);
             String apiId = response.id();
 
-            // Create deployment
+            // Create deployment with custom stage name
             CreateDeploymentRequest deployRequest = CreateDeploymentRequest.builder()
                     .restApiId(apiId)
-                    .stageName("proxy")
+                    .stageName(stageName)
                     .stageDescription("AWS IP Rotator")
                     .description("AWS IP Rotator Production Deployment")
                     .build();
 
             tempClient.createDeployment(deployRequest);
 
-            // Build the proxy URL
-            String proxyUrl = String.format("https://%s.execute-api.%s.amazonaws.com/proxy/",
-                    apiId, targetRegion.id());
+            // Build the proxy URL with custom stage name
+            String proxyUrl = String.format("https://%s.execute-api.%s.amazonaws.com/%s/",
+                    apiId, targetRegion.id(), stageName);
 
-            return new FireProxGateway(
+            return new AwsIpRotatorGateway(
                     apiId,
                     response.name(),
                     response.createdDate(),
@@ -279,10 +291,30 @@ public class FireProxManager {
     }
 
     /**
-     * List all FireProx gateways in the current region
+     * Get the stage name for an API (returns the first deployed stage or "v1" as default)
      */
-    public List<FireProxGateway> listGateways() {
-        List<FireProxGateway> gateways = new ArrayList<>();
+    private String getStageName(ApiGatewayClient client, String apiId) {
+        try {
+            GetStagesRequest request = GetStagesRequest.builder()
+                    .restApiId(apiId)
+                    .build();
+            GetStagesResponse response = client.getStages(request);
+
+            if (response.item() != null && !response.item().isEmpty()) {
+                // Return the first stage name
+                return response.item().get(0).stageName();
+            }
+        } catch (Exception e) {
+            // If we can't get stages, default to "v1"
+        }
+        return "v1"; // Default stage name
+    }
+
+    /**
+     * List all AWS IP Rotator gateways in the current region
+     */
+    public List<AwsIpRotatorGateway> listGateways() {
+        List<AwsIpRotatorGateway> gateways = new ArrayList<>();
         try {
             GetRestApisRequest request = GetRestApisRequest.builder().build();
             GetRestApisResponse response = client.getRestApis(request);
@@ -292,10 +324,11 @@ public class FireProxManager {
                     String apiId = api.id();
                     String targetUrl = getIntegrationUri(apiId);
                     if (targetUrl != null) {
-                        String proxyUrl = String.format("https://%s.execute-api.%s.amazonaws.com/proxy/",
-                                apiId, region.id());
+                        String stageName = getStageName(client, apiId);
+                        String proxyUrl = String.format("https://%s.execute-api.%s.amazonaws.com/%s/",
+                                apiId, region.id(), stageName);
 
-                        gateways.add(new FireProxGateway(
+                        gateways.add(new AwsIpRotatorGateway(
                                 apiId,
                                 api.name(),
                                 api.createdDate(),
@@ -315,10 +348,10 @@ public class FireProxManager {
     }
 
     /**
-     * List all FireProx gateways across all common AWS regions
+     * List all AWS IP Rotator gateways across all common AWS regions (parallel execution)
      */
-    public List<FireProxGateway> listGatewaysAllRegions() {
-        List<FireProxGateway> allGateways = new ArrayList<>();
+    public List<AwsIpRotatorGateway> listGatewaysAllRegions() {
+        List<AwsIpRotatorGateway> allGateways = Collections.synchronizedList(new ArrayList<>());
 
         // Common AWS regions to check
         String[] regions = {
@@ -328,67 +361,85 @@ public class FireProxManager {
             "ca-central-1", "sa-east-1"
         };
 
+        // Create executor service for parallel execution
+        ExecutorService executor = Executors.newFixedThreadPool(Math.min(regions.length, 10));
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+
         for (String regionName : regions) {
-            ApiGatewayClient tempClient = null;
-            try {
-                Region targetRegion = Region.of(regionName);
+            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                ApiGatewayClient tempClient = null;
+                try {
+                    Region targetRegion = Region.of(regionName);
 
-                // Create temporary client for this region
-                if (client != null) {
-                    tempClient = ApiGatewayClient.builder()
-                            .region(targetRegion)
-                            .credentialsProvider(client.serviceClientConfiguration().credentialsProvider())
-                            .build();
-                } else {
-                    continue;
-                }
+                    // Create temporary client for this region
+                    if (client != null) {
+                        tempClient = ApiGatewayClient.builder()
+                                .region(targetRegion)
+                                .credentialsProvider(client.serviceClientConfiguration().credentialsProvider())
+                                .build();
+                    } else {
+                        return;
+                    }
 
-                // List gateways in this region
-                GetRestApisRequest request = GetRestApisRequest.builder().build();
-                GetRestApisResponse response = tempClient.getRestApis(request);
+                    // List gateways in this region
+                    GetRestApisRequest request = GetRestApisRequest.builder().build();
+                    GetRestApisResponse response = tempClient.getRestApis(request);
 
-                for (RestApi api : response.items()) {
-                    try {
-                        String apiId = api.id();
-                        String targetUrl = getIntegrationUriForClient(tempClient, apiId);
-                        if (targetUrl != null) {
-                            String proxyUrl = String.format("https://%s.execute-api.%s.amazonaws.com/proxy/",
-                                    apiId, targetRegion.id());
+                    for (RestApi api : response.items()) {
+                        try {
+                            String apiId = api.id();
+                            String targetUrl = getIntegrationUriForClient(tempClient, apiId);
+                            if (targetUrl != null) {
+                                String stageName = getStageName(tempClient, apiId);
+                                String proxyUrl = String.format("https://%s.execute-api.%s.amazonaws.com/%s/",
+                                        apiId, targetRegion.id(), stageName);
 
-                            allGateways.add(new FireProxGateway(
-                                    apiId,
-                                    api.name(),
-                                    api.createdDate(),
-                                    targetUrl,
-                                    proxyUrl,
-                                    targetRegion.id()
-                            ));
+                                allGateways.add(new AwsIpRotatorGateway(
+                                        apiId,
+                                        api.name(),
+                                        api.createdDate(),
+                                        targetUrl,
+                                        proxyUrl,
+                                        targetRegion.id()
+                                ));
+                            }
+                        } catch (Exception e) {
+                            // Skip APIs that don't have the expected structure
                         }
-                    } catch (Exception e) {
-                        // Skip APIs that don't have the expected structure
+                    }
+                } catch (Exception e) {
+                    // Skip regions where we can't connect or don't have access
+                } finally {
+                    if (tempClient != null) {
+                        tempClient.close();
                     }
                 }
-            } catch (Exception e) {
-                // Skip regions where we can't connect or don't have access
-            } finally {
-                if (tempClient != null) {
-                    tempClient.close();
-                }
-            }
+            }, executor);
+
+            futures.add(future);
+        }
+
+        // Wait for all regions to complete
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        } catch (Exception e) {
+            // Some regions may have failed, but we still return what we got
+        } finally {
+            executor.shutdown();
         }
 
         return allGateways;
     }
 
     /**
-     * Delete a FireProx gateway in the current region
+     * Delete a AWS IP Rotator gateway in the current region
      */
     public boolean deleteGateway(String apiId) {
         return deleteGatewayInRegion(apiId, region.id());
     }
 
     /**
-     * Delete a FireProx gateway in a specific region
+     * Delete a AWS IP Rotator gateway in a specific region
      */
     public boolean deleteGatewayInRegion(String apiId, String regionName) {
         ApiGatewayClient tempClient = null;
@@ -422,7 +473,7 @@ public class FireProxManager {
     }
 
     /**
-     * Update a FireProx gateway to point to a new URL
+     * Update a AWS IP Rotator gateway to point to a new URL
      */
     public boolean updateGateway(String apiId, String newTargetUrl) {
         try {
@@ -554,9 +605,9 @@ public class FireProxManager {
     }
 
     /**
-     * Data class representing a FireProx gateway
+     * Data class representing a AWS IP Rotator gateway
      */
-    public static class FireProxGateway {
+    public static class AwsIpRotatorGateway {
         public final String apiId;
         public final String name;
         public final Instant createdDate;
@@ -564,7 +615,7 @@ public class FireProxManager {
         public final String proxyUrl;
         public final String region;
 
-        public FireProxGateway(String apiId, String name, Instant createdDate,
+        public AwsIpRotatorGateway(String apiId, String name, Instant createdDate,
                                String targetUrl, String proxyUrl, String region) {
             this.apiId = apiId;
             this.name = name;
