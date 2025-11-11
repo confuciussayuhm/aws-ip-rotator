@@ -9,6 +9,7 @@ import burp.api.montoya.http.HttpService;
 import burp.api.montoya.core.Registration;
 import burp.api.montoya.ui.UserInterface;
 import burp.api.montoya.logging.Logging;
+import burp.api.montoya.persistence.PersistedObject;
 
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
@@ -57,6 +58,9 @@ public class AwsIpRotatorExtension implements BurpExtension {
         // Set extension name
         api.extension().setName("AWS IP Rotator");
 
+        // Load persisted domain mappings from Burp project
+        loadDomainMappings();
+
         // Register HTTP handler
         api.http().registerHttpHandler(new AwsIpRotatorHttpHandler());
 
@@ -82,6 +86,125 @@ public class AwsIpRotatorExtension implements BurpExtension {
             }
         }
         return false;
+    }
+
+    /**
+     * Save domain mappings to Burp project file
+     */
+    private void saveDomainMappings() {
+        try {
+            PersistedObject persistedData = api.persistence().extensionData();
+
+            // Clear existing data
+            for (String key : persistedData.childObjectKeys()) {
+                persistedData.deleteChildObject(key);
+            }
+
+            // Save enabled state
+            persistedData.setBoolean("enabled", config.enabled);
+            persistedData.setBoolean("preserveOriginalHost", config.preserveOriginalHost);
+
+            // Save each domain configuration
+            int domainIndex = 0;
+            for (Map.Entry<String, DomainConfig> entry : config.domainConfigs.entrySet()) {
+                String domain = entry.getKey();
+                DomainConfig domainConfig = entry.getValue();
+
+                PersistedObject domainObj = PersistedObject.persistedObject();
+                domainObj.setString("domain", domain);
+                domainObj.setString("strategy", domainConfig.getStrategy().name());
+
+                // Save gateways for this domain
+                List<GatewayConfig> gateways = domainConfig.getGateways();
+                for (int i = 0; i < gateways.size(); i++) {
+                    GatewayConfig gateway = gateways.get(i);
+                    PersistedObject gatewayObj = PersistedObject.persistedObject();
+                    gatewayObj.setString("url", gateway.getGatewayUrl());
+                    gatewayObj.setString("region", gateway.getRegion());
+                    gatewayObj.setInteger("weight", gateway.getWeight());
+                    domainObj.setChildObject("gateway_" + i, gatewayObj);
+                }
+
+                persistedData.setChildObject("domain_" + domainIndex, domainObj);
+                domainIndex++;
+            }
+
+            logging.logToOutput("Domain mappings saved to project file");
+        } catch (Exception e) {
+            logging.logToError("Failed to save domain mappings: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Load domain mappings from Burp project file
+     */
+    private void loadDomainMappings() {
+        try {
+            PersistedObject persistedData = api.persistence().extensionData();
+
+            // Load enabled state
+            Boolean enabled = persistedData.getBoolean("enabled");
+            if (enabled != null) {
+                config.enabled = enabled;
+            }
+
+            Boolean preserveOriginalHost = persistedData.getBoolean("preserveOriginalHost");
+            if (preserveOriginalHost != null) {
+                config.preserveOriginalHost = preserveOriginalHost;
+            }
+
+            // Load domain configurations
+            config.domainConfigs.clear();
+            for (String domainKey : persistedData.childObjectKeys()) {
+                if (!domainKey.startsWith("domain_")) {
+                    continue;
+                }
+
+                PersistedObject domainObj = persistedData.getChildObject(domainKey);
+                String domain = domainObj.getString("domain");
+                String strategyName = domainObj.getString("strategy");
+
+                if (domain == null) {
+                    continue;
+                }
+
+                DomainConfig domainConfig = new DomainConfig(domain);
+
+                // Set rotation strategy
+                if (strategyName != null) {
+                    try {
+                        domainConfig.setStrategy(DomainConfig.RotationStrategy.valueOf(strategyName));
+                    } catch (IllegalArgumentException e) {
+                        // Use default strategy if invalid
+                    }
+                }
+
+                // Load gateways for this domain
+                for (String gatewayKey : domainObj.childObjectKeys()) {
+                    if (!gatewayKey.startsWith("gateway_")) {
+                        continue;
+                    }
+
+                    PersistedObject gatewayObj = domainObj.getChildObject(gatewayKey);
+                    String url = gatewayObj.getString("url");
+                    String region = gatewayObj.getString("region");
+                    Integer weight = gatewayObj.getInteger("weight");
+
+                    if (url != null && region != null) {
+                        GatewayConfig gateway = new GatewayConfig(url, region, weight != null ? weight : 100);
+                        domainConfig.addGateway(gateway);
+                    }
+                }
+
+                config.domainConfigs.put(domain, domainConfig);
+            }
+
+            if (!config.domainConfigs.isEmpty()) {
+                logging.logToOutput("Loaded " + config.domainConfigs.size() + " domain mapping(s) from project file");
+            }
+        } catch (Exception e) {
+            logging.logToError("Failed to load domain mappings: " + e.getMessage());
+        }
     }
 
     /**
@@ -128,12 +251,14 @@ public class AwsIpRotatorExtension implements BurpExtension {
         enabledCheckbox.addActionListener(e -> {
             config.enabled = enabledCheckbox.isSelected();
             logging.logToOutput("IP rotation " + (config.enabled ? "enabled" : "disabled"));
+            saveDomainMappings();
         });
         topPanel.add(enabledCheckbox);
 
         JCheckBox preserveHostCheckbox = new JCheckBox("Preserve original Host in X-Original-Host header", config.preserveOriginalHost);
         preserveHostCheckbox.addActionListener(e -> {
             config.preserveOriginalHost = preserveHostCheckbox.isSelected();
+            saveDomainMappings();
         });
         topPanel.add(preserveHostCheckbox);
 
@@ -247,6 +372,7 @@ public class AwsIpRotatorExtension implements BurpExtension {
                     dc.setStrategy(newStrategy);
                     mappingsTableModel.setValueAt(newStrategy.toString(), row, 2);
                     logging.logToOutput("Changed rotation strategy for " + domain + " to " + newStrategy);
+                    saveDomainMappings();
                 }
             }
         });
@@ -270,6 +396,7 @@ public class AwsIpRotatorExtension implements BurpExtension {
                     config.domainConfigs.put(domain, dc);
                     mappingsTableModel.addRow(new Object[]{domain, 0, dc.getStrategy().toString()});
                     logging.logToOutput("Added domain: " + domain);
+                    saveDomainMappings();
                 }
             }
         });
@@ -289,6 +416,7 @@ public class AwsIpRotatorExtension implements BurpExtension {
                     mappingsTableModel.removeRow(row);
                     gatewayListModel.clear();
                     logging.logToOutput("Removed domain: " + domain);
+                    saveDomainMappings();
                 }
             } else {
                 JOptionPane.showMessageDialog(mainPanel,
@@ -311,6 +439,7 @@ public class AwsIpRotatorExtension implements BurpExtension {
                     mappingsTableModel.setRowCount(0);
                     gatewayListModel.clear();
                     logging.logToOutput("Cleared all domain configurations");
+                    saveDomainMappings();
                 }
             }
         });
@@ -345,6 +474,7 @@ public class AwsIpRotatorExtension implements BurpExtension {
                         gatewayListModel.remove(gatewayIndex);
                         mappingsTableModel.setValueAt(dc.getGatewayCount(), row, 1);
                         logging.logToOutput("Removed gateway from " + domain + ": " + gateway.getGatewayUrl());
+                        saveDomainMappings();
                     }
                 }
             } else {
@@ -375,6 +505,16 @@ public class AwsIpRotatorExtension implements BurpExtension {
                     JOptionPane.WARNING_MESSAGE);
             }
         });
+
+        // Populate table with loaded domain mappings
+        for (Map.Entry<String, DomainConfig> entry : config.domainConfigs.entrySet()) {
+            DomainConfig dc = entry.getValue();
+            mappingsTableModel.addRow(new Object[]{
+                dc.getDomain(),
+                dc.getGatewayCount(),
+                dc.getStrategy().toString()
+            });
+        }
 
         return panel;
     }
@@ -416,6 +556,7 @@ public class AwsIpRotatorExtension implements BurpExtension {
                 gatewayListModel.addElement(String.format("%s (%s) [weight: %d%%]",
                     gateway.getGatewayUrl(), gateway.getRegion(), gateway.getWeight()));
                 logging.logToOutput("Added gateway to " + dc.getDomain() + ": " + gatewayUrl + " (region: " + region + ")");
+                saveDomainMappings();
             } catch (MalformedURLException ex) {
                 JOptionPane.showMessageDialog(mainPanel,
                     "Invalid URL format!",
@@ -455,6 +596,7 @@ public class AwsIpRotatorExtension implements BurpExtension {
                     newGateway.getGatewayUrl(), newGateway.getRegion(), newGateway.getWeight()));
 
                 logging.logToOutput("Updated gateway weight for " + dc.getDomain() + ": " + oldGateway.getGatewayUrl() + " to " + weight + "%");
+                saveDomainMappings();
             } catch (NumberFormatException ex) {
                 JOptionPane.showMessageDialog(mainPanel,
                     "Please enter a valid number between 1 and 100",
