@@ -10,6 +10,8 @@ import burp.api.montoya.core.Registration;
 import burp.api.montoya.ui.UserInterface;
 import burp.api.montoya.logging.Logging;
 import burp.api.montoya.persistence.PersistedObject;
+import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
+import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
@@ -21,8 +23,10 @@ import java.net.URL;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -67,6 +71,9 @@ public class AwsIpRotatorExtension implements BurpExtension {
         // Create and register UI
         createUI();
         api.userInterface().registerSuiteTab("AWS IP Rotator", mainPanel);
+
+        // Register context menu provider for right-click "Send to AWS IP Rotator"
+        api.userInterface().registerContextMenuItemsProvider(new AwsIpRotatorContextMenuProvider());
 
         logging.logToOutput("AWS IP Rotator loaded successfully!");
         logging.logToOutput("Configure multi-region rotation in the 'AWS IP Rotator' tab");
@@ -1504,6 +1511,79 @@ public class AwsIpRotatorExtension implements BurpExtension {
     }
 
     /**
+     * Add domains from a list of HttpRequestResponse items (used by context menu)
+     */
+    private void addDomainsFromRequestResponses(List<HttpRequestResponse> items) {
+        Set<String> uniqueHosts = new LinkedHashSet<>();
+        for (HttpRequestResponse item : items) {
+            try {
+                if (item != null && item.request() != null && item.request().httpService() != null) {
+                    String host = item.request().httpService().host().toLowerCase();
+                    if (!host.isEmpty()) {
+                        uniqueHosts.add(host);
+                    }
+                }
+            } catch (Exception e) {
+                logging.logToError("Failed to extract host from request: " + e.getMessage());
+            }
+        }
+
+        List<String> added = new ArrayList<>();
+        List<String> skipped = new ArrayList<>();
+
+        for (String host : uniqueHosts) {
+            // Check case-insensitively against existing domains
+            boolean exists = false;
+            for (String existingDomain : config.domainConfigs.keySet()) {
+                if (existingDomain.equalsIgnoreCase(host)) {
+                    exists = true;
+                    break;
+                }
+            }
+
+            if (exists) {
+                skipped.add(host);
+            } else {
+                DomainConfig dc = new DomainConfig(host);
+                config.domainConfigs.put(host, dc);
+                mappingsTableModel.addRow(new Object[]{host, 0, dc.getStrategy().toString()});
+                added.add(host);
+                logging.logToOutput("Added domain from context menu: " + host);
+            }
+        }
+
+        if (!added.isEmpty()) {
+            saveDomainMappings();
+        }
+
+        // Build summary dialog
+        StringBuilder message = new StringBuilder();
+        if (!added.isEmpty()) {
+            message.append("Added ").append(added.size()).append(" domain(s):\n");
+            for (String host : added) {
+                message.append("  + ").append(host).append("\n");
+            }
+        }
+        if (!skipped.isEmpty()) {
+            if (message.length() > 0) {
+                message.append("\n");
+            }
+            message.append("Skipped ").append(skipped.size()).append(" duplicate(s):\n");
+            for (String host : skipped) {
+                message.append("  - ").append(host).append("\n");
+            }
+        }
+        if (added.isEmpty() && skipped.isEmpty()) {
+            message.append("No domains found in the selected items.");
+        }
+
+        JOptionPane.showMessageDialog(mainPanel,
+            message.toString(),
+            "Send to AWS IP Rotator",
+            added.isEmpty() ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    /**
      * Update a gateway (non-blocking)
      */
     private void updateGateway(String apiId) {
@@ -1612,6 +1692,36 @@ public class AwsIpRotatorExtension implements BurpExtension {
         boolean enabled = false;
         Map<String, DomainConfig> domainConfigs = new HashMap<>(); // domain -> DomainConfig
         boolean preserveOriginalHost = false;
+    }
+
+    /**
+     * Context menu provider that adds "Send to AWS IP Rotator" to right-click menus
+     */
+    private class AwsIpRotatorContextMenuProvider implements ContextMenuItemsProvider {
+        @Override
+        public List<Component> provideMenuItems(ContextMenuEvent event) {
+            List<HttpRequestResponse> items = new ArrayList<>();
+
+            // Collect from list views (proxy history, site map, search results, etc.)
+            if (event.selectedRequestResponses() != null) {
+                items.addAll(event.selectedRequestResponses());
+            }
+
+            // Collect from message editor (single item view)
+            if (event.messageEditorRequestResponse().isPresent()) {
+                items.add(event.messageEditorRequestResponse().get().requestResponse());
+            }
+
+            if (items.isEmpty()) {
+                return Collections.emptyList();
+            }
+
+            JMenuItem menuItem = new JMenuItem("Send to AWS IP Rotator");
+            final List<HttpRequestResponse> finalItems = items;
+            menuItem.addActionListener(e -> addDomainsFromRequestResponses(finalItems));
+
+            return Collections.singletonList(menuItem);
+        }
     }
 
     /**
