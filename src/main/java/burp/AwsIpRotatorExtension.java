@@ -31,6 +31,8 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * AWS IP Rotator Burp Extension
@@ -1770,7 +1772,7 @@ public class AwsIpRotatorExtension implements BurpExtension {
      * Add domains from a list of HttpRequestResponse items (used by context menu).
      * Extracts unique hosts, detects protocol/port, and launches mass gateway setup.
      */
-    private void addDomainsFromRequestResponses(List<HttpRequestResponse> items) {
+    private void createGatewaysFromRequestResponses(List<HttpRequestResponse> items) {
         // Extract unique hosts with protocol and port info
         // Key: lowercase host, Value: HostInfo with best target URL
         Map<String, HostInfo> hostMap = new LinkedHashMap<>();
@@ -1839,6 +1841,82 @@ public class AwsIpRotatorExtension implements BurpExtension {
     }
 
     /**
+     * Add domain mappings only (no AWS interaction).
+     * Extracts unique hosts from the selected items and creates empty DomainConfig entries.
+     */
+    private void addDomainMappingsOnly(List<HttpRequestResponse> items) {
+        // Extract unique hosts (lowercase)
+        Set<String> seenHosts = new LinkedHashSet<>();
+        for (HttpRequestResponse item : items) {
+            try {
+                if (item == null || item.request() == null || item.request().httpService() == null) {
+                    continue;
+                }
+                String host = item.request().httpService().host().toLowerCase();
+                if (!host.isEmpty()) {
+                    seenHosts.add(host);
+                }
+            } catch (Exception e) {
+                logging.logToError("Failed to extract host from request: " + e.getMessage());
+            }
+        }
+
+        if (seenHosts.isEmpty()) {
+            JOptionPane.showMessageDialog(mainPanel,
+                "No domains found in the selected items.",
+                "Add Domain Mappings",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
+        // Build set of already-configured domains (lowercase) for case-insensitive check
+        Set<String> existingLower = new LinkedHashSet<>();
+        for (String domain : config.domainConfigs.keySet()) {
+            existingLower.add(domain.toLowerCase());
+        }
+
+        List<String> added = new ArrayList<>();
+        List<String> skipped = new ArrayList<>();
+
+        for (String host : seenHosts) {
+            if (existingLower.contains(host)) {
+                skipped.add(host);
+            } else {
+                DomainConfig dc = new DomainConfig(host);
+                config.domainConfigs.put(host, dc);
+                mappingsTableModel.addRow(new Object[]{host, 0, dc.getStrategy().toString()});
+                existingLower.add(host);
+                added.add(host);
+                logging.logToOutput("Added domain mapping: " + host);
+            }
+        }
+
+        if (!added.isEmpty()) {
+            saveDomainMappings();
+        }
+
+        // Show summary
+        StringBuilder summary = new StringBuilder();
+        summary.append("Added ").append(added.size()).append(" domain(s)");
+        if (!added.isEmpty()) {
+            summary.append(":\n");
+            for (String d : added) {
+                summary.append("  + ").append(d).append("\n");
+            }
+        }
+        if (!skipped.isEmpty()) {
+            summary.append("\nSkipped ").append(skipped.size()).append(" duplicate(s)");
+            summary.append(":\n");
+            for (String d : skipped) {
+                summary.append("  - ").append(d).append("\n");
+            }
+        }
+
+        JOptionPane.showMessageDialog(mainPanel, summary.toString(),
+            "Add Domain Mappings", JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    /**
      * Execute mass gateway setup: create gateways for multiple hosts across multiple regions
      */
     private void executeMassGatewaySetup(List<HostInfo> selectedHosts, String stageName, List<String> selectedRegions) {
@@ -1846,16 +1924,41 @@ public class AwsIpRotatorExtension implements BurpExtension {
         logging.logToOutput("Starting mass gateway setup: " + selectedHosts.size() + " host(s) x " +
             selectedRegions.size() + " region(s) = " + totalOps + " gateway(s)...");
 
-        SwingWorker<Map<String, Object>, Void> worker = new SwingWorker<>() {
+        // Create progress dialog (non-modal so it doesn't block the EDT)
+        JDialog progressDialog = new JDialog(SwingUtilities.getWindowAncestor(mainPanel), "Mass Gateway Setup Progress");
+        progressDialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        JPanel progressPanel = new JPanel(new BorderLayout(10, 10));
+        progressPanel.setBorder(BorderFactory.createEmptyBorder(15, 15, 15, 15));
+
+        JProgressBar progressBar = new JProgressBar(0, totalOps);
+        progressBar.setStringPainted(true);
+        progressBar.setString("0 / " + totalOps);
+        progressPanel.add(progressBar, BorderLayout.NORTH);
+
+        JLabel statusLabel = new JLabel("Starting...");
+        statusLabel.setPreferredSize(new Dimension(450, 25));
+        progressPanel.add(statusLabel, BorderLayout.CENTER);
+
+        AtomicBoolean cancelled = new AtomicBoolean(false);
+        JButton cancelButton = new JButton("Cancel");
+        JPanel cancelPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        cancelPanel.add(cancelButton);
+        progressPanel.add(cancelPanel, BorderLayout.SOUTH);
+
+        progressDialog.setContentPane(progressPanel);
+        progressDialog.pack();
+        progressDialog.setLocationRelativeTo(mainPanel);
+        progressDialog.setResizable(false);
+
+        SwingWorker<Map<String, Object>, String> worker = new SwingWorker<>() {
+            private final AtomicInteger completedOps = new AtomicInteger(0);
+
             @Override
             protected Map<String, Object> doInBackground() {
                 Map<String, Object> result = new HashMap<>();
-                // Per-host results: domain -> list of successful gateways
                 Map<String, List<AwsIpRotatorManager.AwsIpRotatorGateway>> successByHost = Collections.synchronizedMap(new LinkedHashMap<>());
-                // Per-host failures: domain -> list of "region: error"
                 Map<String, List<String>> failuresByHost = Collections.synchronizedMap(new LinkedHashMap<>());
 
-                // Initialize maps
                 for (HostInfo host : selectedHosts) {
                     successByHost.put(host.domain, Collections.synchronizedList(new ArrayList<>()));
                     failuresByHost.put(host.domain, Collections.synchronizedList(new ArrayList<>()));
@@ -1867,7 +1970,14 @@ public class AwsIpRotatorExtension implements BurpExtension {
                 for (HostInfo host : selectedHosts) {
                     for (String region : selectedRegions) {
                         CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                            if (cancelled.get()) {
+                                failuresByHost.get(host.domain).add(region + ": Cancelled");
+                                int done = completedOps.incrementAndGet();
+                                publish(done + " / " + totalOps + " (cancelled)");
+                                return;
+                            }
                             try {
+                                publish("Creating gateway " + completedOps.get() + "/" + totalOps + ": " + host.domain + " in " + region + "...");
                                 logging.logToOutput("Creating gateway for " + host.domain + " in " + region + "...");
                                 AwsIpRotatorManager.AwsIpRotatorGateway gateway =
                                     awsManager.createGatewayInRegion(host.targetUrl, region, stageName);
@@ -1883,6 +1993,8 @@ public class AwsIpRotatorExtension implements BurpExtension {
                                 failuresByHost.get(host.domain).add(region + ": " + e.getMessage());
                                 logging.logToError("Exception creating gateway for " + host.domain + " in " + region + ": " + e.getMessage());
                             }
+                            int done = completedOps.incrementAndGet();
+                            publish(done + " / " + totalOps);
                         }, executor);
                         futures.add(future);
                     }
@@ -1902,8 +2014,20 @@ public class AwsIpRotatorExtension implements BurpExtension {
             }
 
             @Override
+            protected void process(List<String> chunks) {
+                // Update progress bar and status label on the EDT
+                String latest = chunks.get(chunks.size() - 1);
+                int done = completedOps.get();
+                progressBar.setValue(done);
+                progressBar.setString(done + " / " + totalOps);
+                statusLabel.setText(latest);
+            }
+
+            @Override
             @SuppressWarnings("unchecked")
             protected void done() {
+                progressDialog.dispose();
+
                 try {
                     Map<String, Object> result = get();
                     Map<String, List<AwsIpRotatorManager.AwsIpRotatorGateway>> successByHost =
@@ -1994,6 +2118,9 @@ public class AwsIpRotatorExtension implements BurpExtension {
                     if (totalFailed > 0) {
                         summary.append(", ").append(totalFailed).append(" failed");
                     }
+                    if (cancelled.get()) {
+                        summary.append("\n\n(Operation was cancelled)");
+                    }
 
                     String title = (totalFailed == 0) ? "Mass Setup Complete" : "Mass Setup Complete (with errors)";
                     int messageType = (totalFailed == 0) ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE;
@@ -2010,6 +2137,14 @@ public class AwsIpRotatorExtension implements BurpExtension {
             }
         };
 
+        cancelButton.addActionListener(e -> {
+            cancelled.set(true);
+            cancelButton.setEnabled(false);
+            cancelButton.setText("Cancelling...");
+            statusLabel.setText("Cancelling remaining operations...");
+        });
+
+        progressDialog.setVisible(true);
         worker.execute();
     }
 
@@ -2159,11 +2294,19 @@ public class AwsIpRotatorExtension implements BurpExtension {
                 return Collections.emptyList();
             }
 
-            JMenuItem menuItem = new JMenuItem("Send to AWS IP Rotator");
             final List<HttpRequestResponse> finalItems = items;
-            menuItem.addActionListener(e -> addDomainsFromRequestResponses(finalItems));
 
-            return Collections.singletonList(menuItem);
+            JMenu submenu = new JMenu("Send to AWS IP Rotator");
+
+            JMenuItem createGatewaysItem = new JMenuItem("Create Gateways");
+            createGatewaysItem.addActionListener(e -> createGatewaysFromRequestResponses(finalItems));
+            submenu.add(createGatewaysItem);
+
+            JMenuItem addMappingsItem = new JMenuItem("Add Domain Mappings");
+            addMappingsItem.addActionListener(e -> addDomainMappingsOnly(finalItems));
+            submenu.add(addMappingsItem);
+
+            return Collections.singletonList(submenu);
         }
     }
 
