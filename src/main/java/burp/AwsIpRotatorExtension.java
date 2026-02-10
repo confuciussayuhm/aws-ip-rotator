@@ -23,6 +23,7 @@ import java.net.URL;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -1454,6 +1455,261 @@ public class AwsIpRotatorExtension implements BurpExtension {
     }
 
     /**
+     * Modal dialog for mass gateway setup from context menu
+     */
+    private static class MassGatewaySetupDialog extends JDialog {
+        private boolean confirmed = false;
+        private JTextField stageNameField;
+        private JCheckBox multiRegionCheckbox;
+        private JComboBox<String> singleRegionCombo;
+        private JPanel regionSelectionPanel;
+        private Map<String, JCheckBox> regionCheckboxes;
+        private DefaultTableModel hostTableModel;
+        private List<HostInfo> allHosts;
+        private Set<String> existingDomains;
+
+        private static final String[] COMMON_REGIONS = {
+            "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+            "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1",
+            "ap-south-1", "ap-northeast-1", "ap-northeast-2", "ap-southeast-1", "ap-southeast-2",
+            "ca-central-1", "sa-east-1"
+        };
+
+        public MassGatewaySetupDialog(JPanel parent, List<HostInfo> hosts, Set<String> existingDomains) {
+            super(SwingUtilities.getWindowAncestor(parent), "Mass Gateway Setup", Dialog.ModalityType.APPLICATION_MODAL);
+            this.allHosts = hosts;
+            this.existingDomains = existingDomains;
+            this.regionCheckboxes = new HashMap<>();
+            initComponents();
+            pack();
+            setLocationRelativeTo(parent);
+        }
+
+        private void initComponents() {
+            setLayout(new BorderLayout(10, 10));
+
+            JPanel contentPanel = new JPanel(new BorderLayout(10, 10));
+            contentPanel.setBorder(BorderFactory.createEmptyBorder(15, 15, 15, 15));
+
+            // === Domain table ===
+            String[] columns = {"Selected", "Domain", "Status"};
+            hostTableModel = new DefaultTableModel(columns, 0) {
+                @Override
+                public Class<?> getColumnClass(int column) {
+                    if (column == 0) return Boolean.class;
+                    return String.class;
+                }
+
+                @Override
+                public boolean isCellEditable(int row, int column) {
+                    if (column != 0) return false;
+                    // Disable checkbox for already-configured domains
+                    String status = (String) getValueAt(row, 2);
+                    return "New".equals(status);
+                }
+            };
+
+            for (HostInfo host : allHosts) {
+                boolean alreadyConfigured = existingDomains.contains(host.domain.toLowerCase());
+                hostTableModel.addRow(new Object[]{
+                    !alreadyConfigured,  // pre-checked for new, unchecked for existing
+                    host.domain,
+                    alreadyConfigured ? "Already configured" : "New"
+                });
+            }
+
+            JTable hostTable = new JTable(hostTableModel);
+            hostTable.setRowHeight(25);
+            hostTable.getColumnModel().getColumn(0).setMaxWidth(70);
+            hostTable.getColumnModel().getColumn(0).setMinWidth(70);
+            hostTable.getColumnModel().getColumn(2).setMaxWidth(130);
+            hostTable.getColumnModel().getColumn(2).setMinWidth(130);
+
+            JScrollPane tableScrollPane = new JScrollPane(hostTable);
+            tableScrollPane.setPreferredSize(new Dimension(550, Math.min(200, 30 + allHosts.size() * 25)));
+            tableScrollPane.setBorder(BorderFactory.createTitledBorder("Domains (" + allHosts.size() + ")"));
+
+            // Select All / Deselect All buttons
+            JPanel selectButtonPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+            JButton selectAllBtn = new JButton("Select All New");
+            JButton deselectAllBtn = new JButton("Deselect All");
+            selectAllBtn.addActionListener(e -> {
+                for (int i = 0; i < hostTableModel.getRowCount(); i++) {
+                    if ("New".equals(hostTableModel.getValueAt(i, 2))) {
+                        hostTableModel.setValueAt(true, i, 0);
+                    }
+                }
+            });
+            deselectAllBtn.addActionListener(e -> {
+                for (int i = 0; i < hostTableModel.getRowCount(); i++) {
+                    if ("New".equals(hostTableModel.getValueAt(i, 2))) {
+                        hostTableModel.setValueAt(false, i, 0);
+                    }
+                }
+            });
+            selectButtonPanel.add(selectAllBtn);
+            selectButtonPanel.add(deselectAllBtn);
+
+            JPanel topPanel = new JPanel(new BorderLayout());
+            topPanel.add(tableScrollPane, BorderLayout.CENTER);
+            topPanel.add(selectButtonPanel, BorderLayout.SOUTH);
+
+            contentPanel.add(topPanel, BorderLayout.NORTH);
+
+            // === Settings panel (stage name + regions) ===
+            JPanel settingsPanel = new JPanel(new GridBagLayout());
+            GridBagConstraints gbc = new GridBagConstraints();
+            gbc.fill = GridBagConstraints.HORIZONTAL;
+            gbc.insets = new Insets(5, 5, 5, 5);
+
+            // Stage Name
+            gbc.gridx = 0; gbc.gridy = 0; gbc.gridwidth = 1;
+            settingsPanel.add(new JLabel("Stage Name:"), gbc);
+
+            stageNameField = new JTextField("v1", 20);
+            stageNameField.setToolTipText("AWS API Gateway stage name (e.g., v1, v2, release, alpha)");
+            gbc.gridx = 1; gbc.gridy = 0; gbc.gridwidth = 2;
+            settingsPanel.add(stageNameField, gbc);
+
+            // Multi-region checkbox
+            multiRegionCheckbox = new JCheckBox("Create in multiple regions");
+            gbc.gridx = 0; gbc.gridy = 1; gbc.gridwidth = 3;
+            settingsPanel.add(multiRegionCheckbox, gbc);
+
+            // Single region combo
+            gbc.gridx = 0; gbc.gridy = 2; gbc.gridwidth = 1;
+            settingsPanel.add(new JLabel("Region:"), gbc);
+
+            singleRegionCombo = new JComboBox<>(COMMON_REGIONS);
+            singleRegionCombo.setSelectedItem("us-east-1");
+            gbc.gridx = 1; gbc.gridy = 2; gbc.gridwidth = 2;
+            settingsPanel.add(singleRegionCombo, gbc);
+
+            // Multi-region panel
+            regionSelectionPanel = new JPanel(new GridLayout(0, 3, 5, 5));
+            regionSelectionPanel.setBorder(BorderFactory.createTitledBorder("Select Regions"));
+
+            for (String region : COMMON_REGIONS) {
+                JCheckBox cb = new JCheckBox(region);
+                regionCheckboxes.put(region, cb);
+                regionSelectionPanel.add(cb);
+            }
+
+            JCheckBox selectAllRegions = new JCheckBox("Select All Regions");
+            selectAllRegions.setVisible(false);
+            selectAllRegions.addActionListener(e -> {
+                boolean selected = selectAllRegions.isSelected();
+                for (JCheckBox cb : regionCheckboxes.values()) {
+                    cb.setSelected(selected);
+                }
+            });
+
+            gbc.gridx = 0; gbc.gridy = 3; gbc.gridwidth = 3;
+            settingsPanel.add(selectAllRegions, gbc);
+
+            JScrollPane regionScrollPane = new JScrollPane(regionSelectionPanel);
+            regionScrollPane.setPreferredSize(new Dimension(500, 150));
+            regionScrollPane.setVisible(false);
+
+            gbc.gridx = 0; gbc.gridy = 4; gbc.gridwidth = 3;
+            gbc.fill = GridBagConstraints.BOTH;
+            gbc.weightx = 1.0; gbc.weighty = 1.0;
+            settingsPanel.add(regionScrollPane, gbc);
+
+            multiRegionCheckbox.addActionListener(e -> {
+                boolean multi = multiRegionCheckbox.isSelected();
+                singleRegionCombo.setVisible(!multi);
+                selectAllRegions.setVisible(multi);
+                regionScrollPane.setVisible(multi);
+                pack();
+            });
+
+            contentPanel.add(settingsPanel, BorderLayout.CENTER);
+            add(contentPanel, BorderLayout.CENTER);
+
+            // === Buttons ===
+            JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+            JButton setupBtn = new JButton("Setup");
+            JButton cancelBtn = new JButton("Cancel");
+
+            setupBtn.addActionListener(e -> {
+                // Validate stage name
+                String stageName = stageNameField.getText().trim();
+                if (stageName.isEmpty()) {
+                    JOptionPane.showMessageDialog(this, "Please enter a stage name", "Error", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+                if (!stageName.matches("[a-zA-Z0-9_-]+")) {
+                    JOptionPane.showMessageDialog(this, "Stage name can only contain letters, numbers, hyphens, and underscores", "Error", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+                if (isStagNameBanned(stageName)) {
+                    JOptionPane.showMessageDialog(this,
+                        "Stage name '" + stageName + "' is not allowed.\n\n" +
+                        "This stage name may be flagged by security systems.\n" +
+                        "Please use a neutral name like: v1, v2, v3, release, alpha, beta, etc.",
+                        "Banned Stage Name", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+                // Validate at least one host selected
+                if (getSelectedHosts().isEmpty()) {
+                    JOptionPane.showMessageDialog(this, "Please select at least one domain", "Error", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+                // Validate at least one region
+                if (getSelectedRegions().isEmpty()) {
+                    JOptionPane.showMessageDialog(this, "Please select at least one region", "Error", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+                confirmed = true;
+                dispose();
+            });
+
+            cancelBtn.addActionListener(e -> {
+                confirmed = false;
+                dispose();
+            });
+
+            buttonPanel.add(setupBtn);
+            buttonPanel.add(cancelBtn);
+            add(buttonPanel, BorderLayout.SOUTH);
+        }
+
+        public boolean isConfirmed() {
+            return confirmed;
+        }
+
+        public String getStageName() {
+            return stageNameField.getText().trim();
+        }
+
+        public List<HostInfo> getSelectedHosts() {
+            List<HostInfo> selected = new ArrayList<>();
+            for (int i = 0; i < hostTableModel.getRowCount(); i++) {
+                Boolean checked = (Boolean) hostTableModel.getValueAt(i, 0);
+                if (checked != null && checked) {
+                    selected.add(allHosts.get(i));
+                }
+            }
+            return selected;
+        }
+
+        public List<String> getSelectedRegions() {
+            List<String> regions = new ArrayList<>();
+            if (multiRegionCheckbox.isSelected()) {
+                for (Map.Entry<String, JCheckBox> entry : regionCheckboxes.entrySet()) {
+                    if (entry.getValue().isSelected()) {
+                        regions.add(entry.getKey());
+                    }
+                }
+            } else {
+                regions.add((String) singleRegionCombo.getSelectedItem());
+            }
+            return regions;
+        }
+    }
+
+    /**
      * Use selected gateway for domain mapping
      */
     private void useGatewayForMapping(String targetUrl, String proxyUrl) {
@@ -1511,76 +1767,250 @@ public class AwsIpRotatorExtension implements BurpExtension {
     }
 
     /**
-     * Add domains from a list of HttpRequestResponse items (used by context menu)
+     * Add domains from a list of HttpRequestResponse items (used by context menu).
+     * Extracts unique hosts, detects protocol/port, and launches mass gateway setup.
      */
     private void addDomainsFromRequestResponses(List<HttpRequestResponse> items) {
-        Set<String> uniqueHosts = new LinkedHashSet<>();
+        // Extract unique hosts with protocol and port info
+        // Key: lowercase host, Value: HostInfo with best target URL
+        Map<String, HostInfo> hostMap = new LinkedHashMap<>();
+
         for (HttpRequestResponse item : items) {
             try {
-                if (item != null && item.request() != null && item.request().httpService() != null) {
-                    String host = item.request().httpService().host().toLowerCase();
-                    if (!host.isEmpty()) {
-                        uniqueHosts.add(host);
-                    }
+                if (item == null || item.request() == null || item.request().httpService() == null) {
+                    continue;
+                }
+                HttpService service = item.request().httpService();
+                String host = service.host().toLowerCase();
+                if (host.isEmpty()) continue;
+
+                boolean isSecure = service.secure();
+                int port = service.port();
+
+                // Build target URL: prefer HTTPS if seen in any request
+                HostInfo existing = hostMap.get(host);
+                if (existing == null || isSecure) {
+                    String scheme = isSecure ? "https" : "http";
+                    boolean nonStandardPort = (isSecure && port != 443) || (!isSecure && port != 80);
+                    String targetUrl = scheme + "://" + host + (nonStandardPort ? ":" + port : "");
+                    hostMap.put(host, new HostInfo(host, targetUrl));
                 }
             } catch (Exception e) {
                 logging.logToError("Failed to extract host from request: " + e.getMessage());
             }
         }
 
-        List<String> added = new ArrayList<>();
-        List<String> skipped = new ArrayList<>();
+        if (hostMap.isEmpty()) {
+            JOptionPane.showMessageDialog(mainPanel,
+                "No domains found in the selected items.",
+                "Send to AWS IP Rotator",
+                JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
 
-        for (String host : uniqueHosts) {
-            // Check case-insensitively against existing domains
-            boolean exists = false;
-            for (String existingDomain : config.domainConfigs.keySet()) {
-                if (existingDomain.equalsIgnoreCase(host)) {
-                    exists = true;
-                    break;
+        // Check if AWS manager is initialized
+        if (awsManager == null) {
+            JOptionPane.showMessageDialog(mainPanel,
+                "AWS credentials are not configured.\n\n" +
+                "Please go to the 'AWS Configuration' tab and connect to AWS first.",
+                "AWS Not Connected",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
+        // Build set of already-configured domains (lowercase)
+        Set<String> existingDomains = new LinkedHashSet<>();
+        for (String domain : config.domainConfigs.keySet()) {
+            existingDomains.add(domain.toLowerCase());
+        }
+
+        List<HostInfo> allHosts = new ArrayList<>(hostMap.values());
+
+        // Show mass gateway setup dialog
+        MassGatewaySetupDialog dialog = new MassGatewaySetupDialog(mainPanel, allHosts, existingDomains);
+        dialog.setVisible(true);
+
+        if (dialog.isConfirmed()) {
+            List<HostInfo> selectedHosts = dialog.getSelectedHosts();
+            String stageName = dialog.getStageName();
+            List<String> selectedRegions = dialog.getSelectedRegions();
+            executeMassGatewaySetup(selectedHosts, stageName, selectedRegions);
+        }
+    }
+
+    /**
+     * Execute mass gateway setup: create gateways for multiple hosts across multiple regions
+     */
+    private void executeMassGatewaySetup(List<HostInfo> selectedHosts, String stageName, List<String> selectedRegions) {
+        int totalOps = selectedHosts.size() * selectedRegions.size();
+        logging.logToOutput("Starting mass gateway setup: " + selectedHosts.size() + " host(s) x " +
+            selectedRegions.size() + " region(s) = " + totalOps + " gateway(s)...");
+
+        SwingWorker<Map<String, Object>, Void> worker = new SwingWorker<>() {
+            @Override
+            protected Map<String, Object> doInBackground() {
+                Map<String, Object> result = new HashMap<>();
+                // Per-host results: domain -> list of successful gateways
+                Map<String, List<AwsIpRotatorManager.AwsIpRotatorGateway>> successByHost = Collections.synchronizedMap(new LinkedHashMap<>());
+                // Per-host failures: domain -> list of "region: error"
+                Map<String, List<String>> failuresByHost = Collections.synchronizedMap(new LinkedHashMap<>());
+
+                // Initialize maps
+                for (HostInfo host : selectedHosts) {
+                    successByHost.put(host.domain, Collections.synchronizedList(new ArrayList<>()));
+                    failuresByHost.put(host.domain, Collections.synchronizedList(new ArrayList<>()));
+                }
+
+                ExecutorService executor = Executors.newFixedThreadPool(Math.min(totalOps, 10));
+                List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+                for (HostInfo host : selectedHosts) {
+                    for (String region : selectedRegions) {
+                        CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                            try {
+                                logging.logToOutput("Creating gateway for " + host.domain + " in " + region + "...");
+                                AwsIpRotatorManager.AwsIpRotatorGateway gateway =
+                                    awsManager.createGatewayInRegion(host.targetUrl, region, stageName);
+
+                                if (gateway != null) {
+                                    successByHost.get(host.domain).add(gateway);
+                                    logging.logToOutput("Created gateway for " + host.domain + " in " + region + ": " + gateway.apiId);
+                                } else {
+                                    failuresByHost.get(host.domain).add(region + ": " + awsManager.getLastError());
+                                    logging.logToError("Failed to create gateway for " + host.domain + " in " + region);
+                                }
+                            } catch (Exception e) {
+                                failuresByHost.get(host.domain).add(region + ": " + e.getMessage());
+                                logging.logToError("Exception creating gateway for " + host.domain + " in " + region + ": " + e.getMessage());
+                            }
+                        }, executor);
+                        futures.add(future);
+                    }
+                }
+
+                try {
+                    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+                } catch (Exception e) {
+                    logging.logToError("Error during mass gateway creation: " + e.getMessage());
+                } finally {
+                    executor.shutdown();
+                }
+
+                result.put("successByHost", successByHost);
+                result.put("failuresByHost", failuresByHost);
+                return result;
+            }
+
+            @Override
+            @SuppressWarnings("unchecked")
+            protected void done() {
+                try {
+                    Map<String, Object> result = get();
+                    Map<String, List<AwsIpRotatorManager.AwsIpRotatorGateway>> successByHost =
+                        (Map<String, List<AwsIpRotatorManager.AwsIpRotatorGateway>>) result.get("successByHost");
+                    Map<String, List<String>> failuresByHost =
+                        (Map<String, List<String>>) result.get("failuresByHost");
+
+                    int totalCreated = 0;
+                    int totalFailed = 0;
+                    int domainsWithGateways = 0;
+
+                    // Process results: create/update domain configs and UI tables
+                    for (HostInfo host : selectedHosts) {
+                        List<AwsIpRotatorManager.AwsIpRotatorGateway> gateways = successByHost.get(host.domain);
+                        if (gateways == null || gateways.isEmpty()) {
+                            totalFailed += failuresByHost.getOrDefault(host.domain, Collections.emptyList()).size();
+                            continue;
+                        }
+
+                        domainsWithGateways++;
+                        totalCreated += gateways.size();
+                        totalFailed += failuresByHost.getOrDefault(host.domain, Collections.emptyList()).size();
+
+                        // Get or create DomainConfig
+                        DomainConfig dc = config.domainConfigs.get(host.domain);
+                        boolean isNewDomain = (dc == null);
+                        if (dc == null) {
+                            dc = new DomainConfig(host.domain);
+                            config.domainConfigs.put(host.domain, dc);
+                        }
+
+                        // Add each gateway to domain config
+                        for (AwsIpRotatorManager.AwsIpRotatorGateway gw : gateways) {
+                            String proxyUrl = gw.proxyUrl;
+                            if (proxyUrl.endsWith("/")) {
+                                proxyUrl = proxyUrl.substring(0, proxyUrl.length() - 1);
+                            }
+                            String region = extractRegionFromUrl(proxyUrl);
+                            GatewayConfig gc = new GatewayConfig(proxyUrl, region);
+                            dc.addGateway(gc);
+
+                            // Add to AWS Gateways table
+                            gatewaysTableModel.addRow(new Object[]{
+                                gw.apiId, gw.name, gw.targetUrl, gw.proxyUrl, gw.region,
+                                gw.createdDate.toString()
+                            });
+                        }
+
+                        // Update or add to Domain Mappings table
+                        if (isNewDomain) {
+                            mappingsTableModel.addRow(new Object[]{
+                                host.domain, dc.getGatewayCount(), dc.getStrategy().toString()
+                            });
+                        } else {
+                            for (int i = 0; i < mappingsTableModel.getRowCount(); i++) {
+                                if (host.domain.equals(mappingsTableModel.getValueAt(i, 0))) {
+                                    mappingsTableModel.setValueAt(dc.getGatewayCount(), i, 1);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    saveDomainMappings();
+
+                    // Build summary
+                    StringBuilder summary = new StringBuilder("Mass Setup Complete:\n\n");
+                    for (HostInfo host : selectedHosts) {
+                        List<AwsIpRotatorManager.AwsIpRotatorGateway> gateways = successByHost.get(host.domain);
+                        List<String> failures = failuresByHost.getOrDefault(host.domain, Collections.emptyList());
+
+                        if (gateways != null && !gateways.isEmpty()) {
+                            StringBuilder regions = new StringBuilder();
+                            for (int i = 0; i < gateways.size(); i++) {
+                                if (i > 0) regions.append(", ");
+                                regions.append(gateways.get(i).region);
+                            }
+                            summary.append("+ ").append(host.domain).append(": ")
+                                .append(gateways.size()).append(" gateway(s) (").append(regions).append(")\n");
+                        }
+                        for (String failure : failures) {
+                            summary.append("x ").append(host.domain).append(": Failed in ").append(failure).append("\n");
+                        }
+                    }
+
+                    summary.append("\nTotal: ").append(totalCreated).append(" gateway(s) created across ")
+                        .append(domainsWithGateways).append(" domain(s)");
+                    if (totalFailed > 0) {
+                        summary.append(", ").append(totalFailed).append(" failed");
+                    }
+
+                    String title = (totalFailed == 0) ? "Mass Setup Complete" : "Mass Setup Complete (with errors)";
+                    int messageType = (totalFailed == 0) ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE;
+                    JOptionPane.showMessageDialog(mainPanel, summary.toString(), title, messageType);
+
+                    logging.logToOutput("Mass gateway setup complete: " + totalCreated + " created, " + totalFailed + " failed");
+
+                } catch (Exception ex) {
+                    logging.logToError("Failed to process mass gateway setup results: " + ex.getMessage());
+                    JOptionPane.showMessageDialog(mainPanel,
+                        "Failed during mass gateway setup: " + ex.getMessage(),
+                        "Error", JOptionPane.ERROR_MESSAGE);
                 }
             }
+        };
 
-            if (exists) {
-                skipped.add(host);
-            } else {
-                DomainConfig dc = new DomainConfig(host);
-                config.domainConfigs.put(host, dc);
-                mappingsTableModel.addRow(new Object[]{host, 0, dc.getStrategy().toString()});
-                added.add(host);
-                logging.logToOutput("Added domain from context menu: " + host);
-            }
-        }
-
-        if (!added.isEmpty()) {
-            saveDomainMappings();
-        }
-
-        // Build summary dialog
-        StringBuilder message = new StringBuilder();
-        if (!added.isEmpty()) {
-            message.append("Added ").append(added.size()).append(" domain(s):\n");
-            for (String host : added) {
-                message.append("  + ").append(host).append("\n");
-            }
-        }
-        if (!skipped.isEmpty()) {
-            if (message.length() > 0) {
-                message.append("\n");
-            }
-            message.append("Skipped ").append(skipped.size()).append(" duplicate(s):\n");
-            for (String host : skipped) {
-                message.append("  - ").append(host).append("\n");
-            }
-        }
-        if (added.isEmpty() && skipped.isEmpty()) {
-            message.append("No domains found in the selected items.");
-        }
-
-        JOptionPane.showMessageDialog(mainPanel,
-            message.toString(),
-            "Send to AWS IP Rotator",
-            added.isEmpty() ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.INFORMATION_MESSAGE);
+        worker.execute();
     }
 
     /**
@@ -1682,6 +2112,19 @@ public class AwsIpRotatorExtension implements BurpExtension {
                     "Error",
                     JOptionPane.ERROR_MESSAGE);
             }
+        }
+    }
+
+    /**
+     * Simple holder for a domain and its target URL (used by mass gateway setup)
+     */
+    private static class HostInfo {
+        final String domain;     // e.g. "api.example.com"
+        final String targetUrl;  // e.g. "https://api.example.com" or "http://api.example.com:8080"
+
+        HostInfo(String domain, String targetUrl) {
+            this.domain = domain;
+            this.targetUrl = targetUrl;
         }
     }
 
